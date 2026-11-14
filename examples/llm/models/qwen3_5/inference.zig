@@ -137,6 +137,7 @@ pub const KernelRunner = struct {
             .sampler = .{
                 .norm = buffers.text_model.norm,
                 .lm_head = buffers.lm_head,
+                .embed_tokens = buffers.text_model.embed_tokens,
             },
         });
         errdefer sample.deinit(allocator);

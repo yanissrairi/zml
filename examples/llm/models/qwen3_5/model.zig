@@ -109,7 +109,7 @@ pub const LoadedModel = struct {
     pub fn unloadBuffers(self: *const LoadedModel, buffers: *Buffers, allocator: std.mem.Allocator) void {
         _ = self;
         TextModel.unloadBuffers(&buffers.text_model, allocator);
-        zml.nn.Linear.unloadBuffers(&buffers.lm_head);
+        if (buffers.lm_head) |*lm_head| zml.nn.Linear.unloadBuffers(lm_head);
     }
 
     pub fn compile(
@@ -140,7 +140,7 @@ pub const Model = struct {
     };
 
     text_model: TextModel,
-    lm_head: zml.nn.Linear,
+    lm_head: ?zml.nn.Linear,
 
     config: Config,
     gen_options: GenOptions,
@@ -151,18 +151,15 @@ pub const Model = struct {
     },
 
     pub fn init(allocator: std.mem.Allocator, store: zml.io.TensorStore.View, config: Config, gen_options: GenOptions) !Model {
-        // For some Qwen3.5 versions, the output projection lm_head has a standalone weight tensor, while for others it's the same as the input embedding layer
-        const lm_head_prefix = b: {
-            if (store.hasKey("lm_head.weight")) break :b "lm_head";
-            break :b "model.language_model.embed_tokens";
-        };
+        // Some Qwen3.5 versions ship a standalone lm_head weight, the others tie it to the input embedding.
+        // In the tied case the sampler reads the embedding table, so it is only loaded once.
+        const lm_head: ?zml.nn.Linear = if (store.withPrefix("lm_head").maybeCreateTensor("weight", .{ .dout, .d }, .model, .{ .dout = .model, .d = .replicated })) |weight|
+            .init(weight, null, .d)
+        else
+            null;
         return .{
             .text_model = try .init(allocator, store.withPrefix("model.language_model"), config),
-            .lm_head = .init(
-                store.withPrefix(lm_head_prefix).createTensor("weight", .{ .dout, .d }, .model, .{ .dout = .model, .d = .replicated }),
-                null,
-                .d,
-            ),
+            .lm_head = lm_head,
             .config = config,
             .gen_options = gen_options,
         };
@@ -207,7 +204,7 @@ pub const Model = struct {
 
     pub fn unloadBuffers(self: *zml.Bufferized(Model), allocator: std.mem.Allocator) void {
         TextModel.unloadBuffers(&self.text_model, allocator);
-        zml.nn.Linear.unloadBuffers(&self.lm_head);
+        if (self.lm_head) |*lm_head| zml.nn.Linear.unloadBuffers(lm_head);
     }
     pub fn forward(
         self: Model,
@@ -234,6 +231,7 @@ pub const Model = struct {
         return .{
             .norm = self.text_model.norm,
             .lm_head = self.lm_head,
+            .embed_tokens = self.text_model.embed_tokens,
             .gen_options = self.gen_options,
         };
     }
@@ -241,7 +239,8 @@ pub const Model = struct {
 
 pub const Sampler = struct {
     norm: RmsNorm,
-    lm_head: zml.nn.Linear,
+    lm_head: ?zml.nn.Linear,
+    embed_tokens: zml.nn.TokenEmbedding,
     gen_options: Model.GenOptions,
 
     pub const Input = struct {
@@ -263,7 +262,8 @@ pub const Sampler = struct {
         const self = input.sampler;
         const last_index = input.active_length.convert(.i32).addConstant(-1);
         const x = self.norm.forward(input.hidden.slice(.s, .dyn(last_index, 1)));
-        const logits = self.lm_head.forward(x.withPartialTags(.{.d}), x.dtype()).rename(.{ .dout = .voc });
+        const lm_head = self.lm_head orelse zml.nn.Linear.init(self.embed_tokens.weight.withTags(.{ .dout, .d }), null, .d);
+        const logits = lm_head.forward(x.withPartialTags(.{.d}), x.dtype()).rename(.{ .dout = .voc });
         const next_tokens, const new_rng = zml.nn.sampleTokens(logits, self.gen_options.sampling_strategy, input.rng);
         const tokens = next_tokens.convert(.u32);
         return .{
